@@ -63,32 +63,13 @@ class PanelHead(Widget):
     def on_click(self, event: Click) -> None:
         panel = self.panel
         panel.focus()
-        offset = event.get_content_offset(self)
-        if offset is None:
-            event.stop()
-            return
-        if offset.y == 0:
-            self.run_worker(
-                self.app.action_edit_symbol(),
-                name="edit",
-                group="edit",
-                exclusive=True,
-                exit_on_error=False,
-            )
-        elif offset.x < 6:
-            self.app.notify(
-                "Tracking only — this app does not send orders.",
-                title="Buy",
-                severity="warning",
-                timeout=3,
-            )
-        elif offset.x < 13:
-            self.app.notify(
-                "Tracking only — this app does not send orders.",
-                title="Sell",
-                severity="warning",
-                timeout=3,
-            )
+        self.run_worker(
+            self.app.action_edit_symbol(),
+            name="edit",
+            group="edit",
+            exclusive=True,
+            exit_on_error=False,
+        )
         event.stop()
 
     def render(self) -> Text:
@@ -118,12 +99,7 @@ class PanelHead(Widget):
             right.append(fmt_price(opened), style="#d5e0e6")
             right.append("  C ", style="#8aa4ae")
             right.append(fmt_price(quote.price), style="bold #ffb067")
-        return Text("\n").join(
-            [
-                _fit(left, Text(""), width),
-                _fit(Text.assemble((" Buy ", "bold #d8ffe8 on #1d5a40"), " ", (" Sell ", "bold #ffd7cc on #6a3228")), right, width),
-            ]
-        )
+        return _fit(left, right, width)
 
     @property
     def panel(self) -> ChartPanel:
@@ -384,7 +360,7 @@ class TrackerApp(App):
         border: solid #3ee07a;
     }
     .head {
-        height: 2;
+        height: 1;
         padding: 0 1;
         background: #10181c;
         overflow-x: hidden;

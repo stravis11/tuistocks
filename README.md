@@ -13,4 +13,4 @@ uv run tuistock --symbols AAPL,ETH,NVDA,SPY
 uv run tuistock --reset
 ```
 
-Stocks use Nasdaq's realtime quotes, and Yahoo candles when that feed is available so the volume bars can draw. Crypto uses Coinbase candles and the live trade feed. Buy and Sell match the chart layout; this app does not send orders. Multi-day stock charts use daily bars.
+Stocks use Nasdaq's realtime quotes, and Yahoo candles when that feed is available so the volume bars can draw. Crypto uses Coinbase candles and the live trade feed. Multi-day stock charts use daily bars.
