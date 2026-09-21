@@ -1,5 +1,5 @@
 [project]
-name = "grok47-stock-tui"
+name = "tuistock"
 version = "0.1.0"
 description = "Realtime stock and crypto charts in the terminal"
 readme = "README.md"
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-grok47-stock-tui = "grok47_stock_tui:main"
+tuistock = "tuistock:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
