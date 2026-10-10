@@ -1,4 +1,4 @@
-"""Four-panel realtime stock and crypto chart board."""
+"""Realtime stock and crypto chart board with selectable square grids."""
 
 from __future__ import annotations
 
@@ -21,7 +21,9 @@ from textual.widgets import Input
 
 from tuistock.chart import fmt_change, fmt_price, render_chart, select_window
 from tuistock.config import (
+    GRID_SIZES,
     INTERVALS,
+    MAX_PANELS,
     PanelState,
     allowed_ranges,
     clamp_range,
@@ -41,13 +43,6 @@ from tuistock.market import (
     patch_price,
     resolve_symbol,
 )
-
-_MOVES = {
-    "left": (0, 1, 2, 3),
-    "right": (1, 1, 3, 3),
-    "up": (0, 1, 0, 1),
-    "down": (2, 3, 2, 3),
-}
 
 
 class SymbolInput(Input):
@@ -300,7 +295,7 @@ class StatusBar(Widget):
         now = datetime.now().astimezone().strftime("%H:%M:%S")
         ages = [
             time.time() - panel.quote.updated_at
-            for panel in app.query(ChartPanel)
+            for panel in app.active_panels()
             if panel.quote is not None
         ]
         if not ages:
@@ -311,9 +306,14 @@ class StatusBar(Widget):
             state, style = "DELAYED", "#e0a050"
         else:
             state, style = "STALE", "#ff7d72"
-        hints = "1-4 focus   e symbol   i interval   r range   q quit"
+        layout_hint = f"g {app.grid_size}x{app.grid_size}"
+        hints = f"1-9 focus   {layout_hint}   e symbol   i interval   r range   q quit"
+        if width < 100:
+            hints = f"{layout_hint}   e symbol   i interval   r range   q quit"
         if width < 78:
-            hints = "e symbol   i interval   r range   q quit"
+            hints = f"{layout_hint}   e symbol   i/r   q quit"
+        if width < 58:
+            hints = layout_hint
         left = Text()
         left.append(" tuistock ", style="bold #06281c on #3ee07a")
         left.append("  ")
@@ -325,7 +325,7 @@ class StatusBar(Widget):
 
 
 class TrackerApp(App):
-    """2×2 live chart board."""
+    """Live chart board with 1×1 through 4×4 layouts."""
 
     TITLE = "tuistock"
     ENABLE_COMMAND_PALETTE = False
@@ -337,10 +337,9 @@ class TrackerApp(App):
     }
     #board {
         layout: grid;
-        grid-size: 2 2;
         grid-gutter: 1 1;
-        grid-columns: 1fr 1fr;
-        grid-rows: 1fr 1fr;
+        grid-columns: 1fr;
+        grid-rows: 1fr;
         height: 1fr;
         width: 1fr;
         background: #0c1214;
@@ -397,20 +396,25 @@ class TrackerApp(App):
         Binding("e", "edit_symbol", "Symbol"),
         Binding("i", "cycle_interval", "Interval"),
         Binding("r", "cycle_range", "Range"),
+        Binding("g", "cycle_layout", "Layout"),
         Binding("escape", "cancel_edit", show=False),
         Binding("up,k", "focus_move('up')", show=False),
         Binding("down,j", "focus_move('down')", show=False),
         Binding("left,h", "focus_move('left')", show=False),
         Binding("right,l", "focus_move('right')", show=False),
-        Binding("1", "focus_index(0)", show=False),
-        Binding("2", "focus_index(1)", show=False),
-        Binding("3", "focus_index(2)", show=False),
-        Binding("4", "focus_index(3)", show=False),
+        *[
+            Binding(str(index + 1), f"focus_index({index})", show=False)
+            for index in range(9)
+        ],
     ]
 
-    def __init__(self, states: list[PanelState]) -> None:
+    def __init__(self, states: list[PanelState], grid_size: int = 2) -> None:
+        if type(grid_size) is not int or grid_size not in GRID_SIZES:
+            raise ValueError("Grid size must be 1, 2, 3, or 4")
         super().__init__()
-        self.states = states
+        self.states = list(states[:MAX_PANELS])
+        self.states.extend(default_states()[len(self.states):])
+        self.grid_size = grid_size
         self._client: httpx.AsyncClient | None = None
         self._poll_seconds = 4.0
         self._poll_tick = 0
@@ -418,9 +422,14 @@ class TrackerApp(App):
         self.crypto_connected = False
 
     def compose(self) -> ComposeResult:
-        with Grid(id="board"):
+        board = Grid(id="board")
+        board.styles.grid_size_columns = self.grid_size
+        board.styles.grid_size_rows = self.grid_size
+        with board:
             for index, state in enumerate(self.states):
-                yield ChartPanel(state, index, id=f"p{index}")
+                panel = ChartPanel(state, index, id=f"p{index}")
+                panel.display = index < self.grid_size ** 2
+                yield panel
         yield StatusBar()
 
     def on_mount(self) -> None:
@@ -503,6 +512,27 @@ class TrackerApp(App):
         if panel is not None and not self.query(SymbolInput):
             panel.cycle_range()
 
+    def action_cycle_layout(self) -> None:
+        if self.query(SymbolInput):
+            return
+        previous_count = self.grid_size ** 2
+        current = GRID_SIZES.index(self.grid_size)
+        self.grid_size = GRID_SIZES[(current + 1) % len(GRID_SIZES)]
+        board = self.query_one("#board", Grid)
+        board.styles.grid_size_columns = self.grid_size
+        board.styles.grid_size_rows = self.grid_size
+        panel = self.focused_panel()
+        for item in self.query(ChartPanel):
+            item.display = item.index < self.grid_size ** 2
+        if panel is None or panel.index >= self.grid_size ** 2:
+            self.action_focus_index(0)
+        self.persist()
+        self.bump_stream()
+        for item in self.active_panels():
+            if item.index >= previous_count:
+                self.request_refresh(item)
+        self._refresh_status()
+
     def action_focus_move(self, direction: str) -> None:
         if isinstance(self.focused, SymbolInput):
             return
@@ -510,11 +540,21 @@ class TrackerApp(App):
         if panel is None:
             self.action_focus_index(0)
             return
-        target = _MOVES[direction][panel.index]
-        self.action_focus_index(target)
+        row, column = divmod(panel.index, self.grid_size)
+        if direction == "left":
+            column = max(0, column - 1)
+        elif direction == "right":
+            column = min(self.grid_size - 1, column + 1)
+        elif direction == "up":
+            row = max(0, row - 1)
+        elif direction == "down":
+            row = min(self.grid_size - 1, row + 1)
+        self.action_focus_index(row * self.grid_size + column)
 
     def action_focus_index(self, index: int) -> None:
         if isinstance(self.focused, SymbolInput):
+            return
+        if not 0 <= index < self.grid_size ** 2:
             return
         try:
             self.query_one(f"#p{index}", ChartPanel).focus()
@@ -532,8 +572,12 @@ class TrackerApp(App):
             [
                 PanelState(panel.symbol, panel.interval, panel.range_key)
                 for panel in self.query(ChartPanel)
-            ]
+            ],
+            self.grid_size,
         )
+
+    def active_panels(self) -> list[ChartPanel]:
+        return [panel for panel in self.query(ChartPanel) if panel.display]
 
     def bump_stream(self) -> None:
         self._stream_gen += 1
@@ -562,7 +606,7 @@ class TrackerApp(App):
     async def _refresh_all(self) -> None:
         full = self._poll_tick % 4 == 0
         self._poll_tick += 1
-        panels = list(self.query(ChartPanel))
+        panels = self.active_panels()
         results = await asyncio.gather(
             *(self._refresh_panel(panel, full=full) for panel in panels)
         )
@@ -574,7 +618,7 @@ class TrackerApp(App):
 
     async def _refresh_panel(self, panel: ChartPanel, full: bool = True) -> str:
         client = self._client
-        if client is None or not panel.is_mounted:
+        if client is None or not panel.is_mounted or not panel.display:
             return "error"
         if not full and panel.quote is not None and panel.shown_quote is not None:
             try:
@@ -657,7 +701,7 @@ class TrackerApp(App):
     def _coinbase_products(self) -> list[str]:
         products: list[str] = []
         seen: set[str] = set()
-        for panel in self.query(ChartPanel):
+        for panel in self.active_panels():
             if not panel.is_crypto:
                 continue
             if panel.quote is not None and panel.quote.venue == "coinbase":
@@ -682,7 +726,7 @@ class TrackerApp(App):
         except (KeyError, TypeError, ValueError):
             return
         base = product.split("-")[0]
-        for panel in self.query(ChartPanel):
+        for panel in self.active_panels():
             quote = panel.shown_quote
             if quote is None or quote.venue != "coinbase" or quote.display != base:
                 continue
@@ -696,8 +740,13 @@ class TrackerApp(App):
             return
 
 
-def run(states: list[PanelState] | None = None) -> None:
-    TrackerApp(states or load_layout()).run()
+def run(states: list[PanelState] | None = None, grid_size: int | None = None) -> None:
+    if states is None:
+        layout = load_layout()
+        states = layout.panels
+        if grid_size is None:
+            grid_size = layout.grid_size
+    TrackerApp(states, grid_size if grid_size is not None else 2).run()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -707,7 +756,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--symbols",
-        help="Comma-separated tickers for the four panels, e.g. TSLA,SPCX,BTC,SOL",
+        help="Up to 16 comma-separated tickers, e.g. TSLA,SPCX,BTC,SOL",
+    )
+    parser.add_argument(
+        "--layout",
+        choices=tuple(f"{size}x{size}" for size in GRID_SIZES),
+        help="Chart grid size (default: saved layout or 2x2)",
     )
     parser.add_argument(
         "--interval",
@@ -723,17 +777,21 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="Restore TSLA, SPCX, BTC, and SOL",
+        help="Restore the default symbols and 2x2 layout",
     )
     args = parser.parse_args(argv)
-    states = default_states() if args.reset else load_layout()
+    layout = load_layout() if not args.reset else None
+    states = layout.panels if layout else default_states()
+    grid_size = layout.grid_size if layout else 2
+    if args.layout:
+        grid_size = int(args.layout[0])
     if args.symbols:
         symbols = [part.strip() for part in args.symbols.split(",") if part.strip()]
         if not symbols:
             parser.error("--symbols needs at least one ticker")
-        for index, symbol in enumerate(symbols[:4]):
-            if index >= len(states):
-                break
+        if len(symbols) > MAX_PANELS:
+            parser.error("--symbols supports at most 16 tickers")
+        for index, symbol in enumerate(symbols):
             states[index].symbol = symbol.upper()
     if args.interval:
         for state in states:
@@ -744,9 +802,9 @@ def main(argv: list[str] | None = None) -> None:
     else:
         for state in states:
             state.range_key = clamp_range(state.interval, state.range_key)
-    if args.reset or args.symbols or args.interval or args.range_key:
-        save_layout(states)
-    run(states)
+    if args.reset or args.symbols or args.interval or args.range_key or args.layout:
+        save_layout(states, grid_size)
+    run(states, grid_size)
 
 
 def _guess_crypto(symbol: str) -> bool:
