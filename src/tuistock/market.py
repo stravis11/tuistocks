@@ -43,6 +43,10 @@ class RateLimit(MarketError):
     """The feed asked us to slow down."""
 
 
+class Blocked(MarketError):
+    """The feed refused this client outright, regardless of symbol."""
+
+
 @dataclass
 class Candle:
     ts: int
@@ -104,6 +108,14 @@ _NASDAQ_HEADERS = {
 }
 _ASSET_CLASS: dict[str, str] = {}
 _yahoo_blocked_until = 0.0
+# A Nasdaq 403 is Akamai refusing the client, not the symbol, so retrying it on
+# every poll only adds load. Wait before asking again.
+_NASDAQ_BLOCK_SECONDS = 600
+_nasdaq_blocked_until = 0.0
+# Stocks fall back to BASE-USD on Coinbase. Remember the misses so a stock
+# watchlist does not drain Coinbase's per-IP limit that crypto panels rely on.
+_COINBASE_MISSING_SECONDS = 3600
+_COINBASE_MISSING: dict[str, float] = {}
 _YAHOO_URLS = (
     "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
     "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
@@ -166,7 +178,9 @@ async def load_quote(
         pass
     try:
         return await _nasdaq_quote(client, display, interval, range_key)
-    except RateLimit:
+    except (Blocked, RateLimit):
+        # Nasdaq could not say whether this is a stock. Falling back to Coinbase
+        # here would chart an unrelated token that shares the ticker (e.g. META).
         raise
     except MarketError as first:
         try:
@@ -208,6 +222,8 @@ async def _coinbase_quote(
     interval: str,
     range_key: str,
 ) -> Quote:
+    if _COINBASE_MISSING.get(product, 0.0) > time.monotonic():
+        raise MarketError(f"No data for {display}")
     granularity = INTERVAL_SECONDS[interval]
     span = _RANGE_SECONDS.get(range_key, 86_400)
     now = int(time.time())
@@ -246,6 +262,7 @@ async def _coinbase_stats(client: httpx.AsyncClient, product: str) -> dict:
     if response.status_code == 429:
         raise RateLimit("rate limited")
     if response.status_code == 404:
+        _COINBASE_MISSING[product] = time.monotonic() + _COINBASE_MISSING_SECONDS
         raise MarketError(f"No data for {product.split('-')[0]}")
     if response.status_code >= 400:
         raise MarketError("data unavailable")
@@ -279,6 +296,7 @@ async def _coinbase_candles(
         if response.status_code == 429:
             raise RateLimit("rate limited")
         if response.status_code == 404:
+            _COINBASE_MISSING[product] = time.monotonic() + _COINBASE_MISSING_SECONDS
             raise MarketError(f"No data for {product.split('-')[0]}")
         if response.status_code >= 400:
             raise MarketError("data unavailable")
@@ -486,6 +504,8 @@ async def _asset_class(client: httpx.AsyncClient, symbol: str) -> str:
             payload = await _nasdaq_json(
                 client, f"https://api.nasdaq.com/api/quote/{symbol}/info?assetclass={asset}"
             )
+        except (Blocked, RateLimit):
+            raise
         except MarketError as exc:
             last_error = exc
             continue
@@ -499,12 +519,18 @@ async def _asset_class(client: httpx.AsyncClient, symbol: str) -> str:
 
 
 async def _nasdaq_json(client: httpx.AsyncClient, url: str) -> dict:
+    global _nasdaq_blocked_until
+    if time.monotonic() < _nasdaq_blocked_until:
+        raise Blocked("Nasdaq blocked (403)")
     try:
         response = await client.get(url, headers=_NASDAQ_HEADERS)
     except httpx.HTTPError as exc:
         raise MarketError("data unavailable") from exc
     if response.status_code == 429:
         raise RateLimit("rate limited")
+    if response.status_code == 403:
+        _nasdaq_blocked_until = time.monotonic() + _NASDAQ_BLOCK_SECONDS
+        raise Blocked("Nasdaq blocked (403)")
     if response.status_code >= 400:
         raise MarketError("data unavailable")
     try:
