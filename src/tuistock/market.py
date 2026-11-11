@@ -402,29 +402,35 @@ async def _yahoo_quote(
         "includePrePost": "true",
     }
     last_error: MarketError = MarketError(f"No data for {display}")
-    # Yahoo spells share-class tickers with a dash (BRK-B), Nasdaq with a dot.
-    symbol = display.replace(".", "-")
-    for template in _YAHOO_URLS:
-        try:
-            response = await client.get(template.format(symbol=symbol), params=params)
-        except _HTTP_ERRORS as exc:
-            last_error = MarketError("data unavailable")
-            continue
-        if response.status_code == 429:
-            _yahoo_blocked_until = time.monotonic() + 120
-            raise RateLimit("rate limited")
-        if response.status_code >= 400:
-            last_error = MarketError(f"No data for {display}")
-            continue
-        try:
-            payload = response.json()
-        except ValueError:
-            last_error = MarketError("data unavailable")
-            continue
-        try:
-            return _parse_yahoo(payload, display, interval, range_key)
-        except MarketError as exc:
-            last_error = exc
+    # US share classes are dashed on Yahoo (BRK-B) while every other dotted
+    # ticker keeps its dot (SHOP.TO, VOD.L, 7203.T). Try the ticker as typed,
+    # then the dashed spelling.
+    symbols = [display]
+    dashed = display.replace(".", "-")
+    if dashed != display:
+        symbols.append(dashed)
+    for symbol in symbols:
+        for template in _YAHOO_URLS:
+            try:
+                response = await client.get(template.format(symbol=symbol), params=params)
+            except _HTTP_ERRORS as exc:
+                last_error = MarketError("data unavailable")
+                continue
+            if response.status_code == 429:
+                _yahoo_blocked_until = time.monotonic() + 120
+                raise RateLimit("rate limited")
+            if response.status_code >= 400:
+                last_error = MarketError(f"No data for {display}")
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                last_error = MarketError("data unavailable")
+                continue
+            try:
+                return _parse_yahoo(payload, display, interval, range_key)
+            except MarketError as exc:
+                last_error = exc
     raise last_error
 
 
