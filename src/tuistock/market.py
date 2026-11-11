@@ -222,11 +222,14 @@ async def prefetch_snapshots(client: MarketClientProtocol, symbols: list[str]) -
     """
     if not symbols:
         return
-    response = await client.get(
-        f"{_ALPACA_BASE}/v2/stocks/snapshots",
-        params={"symbols": ",".join(sorted(set(symbols))), "feed": "iex"},
-        headers=_alpaca_headers(),
-    )
+    try:
+        response = await client.get(
+            f"{_ALPACA_BASE}/v2/stocks/snapshots",
+            params={"symbols": ",".join(sorted(set(symbols))), "feed": "iex"},
+            headers=_alpaca_headers(),
+        )
+    except _HTTP_ERRORS as exc:
+        raise MarketError("data unavailable") from exc
     _reject_alpaca_auth(response)
     if response.status_code == 429:
         raise RateLimit("rate limited")
@@ -255,11 +258,14 @@ async def _alpaca_snapshot(client: MarketClientProtocol, display: str) -> dict:
     cached = _cached_alpaca_snapshot(display)
     if cached is not None:
         return cached
-    response = await client.get(
-        f"{_ALPACA_BASE}/v2/stocks/snapshots",
-        params={"symbols": display.upper(), "feed": "iex"},
-        headers=_alpaca_headers(),
-    )
+    try:
+        response = await client.get(
+            f"{_ALPACA_BASE}/v2/stocks/snapshots",
+            params={"symbols": display.upper(), "feed": "iex"},
+            headers=_alpaca_headers(),
+        )
+    except _HTTP_ERRORS as exc:
+        raise MarketError("data unavailable") from exc
     _reject_alpaca_auth(response)
     if response.status_code == 429:
         raise RateLimit("rate limited")
@@ -306,9 +312,12 @@ async def _alpaca_quote(
         }
         if page_token:
             params["page_token"] = page_token
-        response = await client.get(
-            f"{_ALPACA_BASE}/v2/stocks/bars", params=params, headers=_alpaca_headers()
-        )
+        try:
+            response = await client.get(
+                f"{_ALPACA_BASE}/v2/stocks/bars", params=params, headers=_alpaca_headers()
+            )
+        except _HTTP_ERRORS as exc:
+            raise MarketError("data unavailable") from exc
         _reject_alpaca_auth(response)
         if response.status_code == 429:
             raise RateLimit("rate limited")

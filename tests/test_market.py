@@ -236,6 +236,34 @@ class AlpacaFeedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quote.session_volume, 5400)
         self.assertEqual(len(quote.candles), 2)
 
+    async def test_network_failure_falls_back_to_yahoo(self):
+        """An unreachable Alpaca must not escape load_quote as a raw error."""
+        seen: list[str] = []
+
+        def handler(host: str, path: str, query: str = "") -> FakeResponse:
+            seen.append(f"{host}{path}")
+            if host == "data.alpaca.markets":
+                raise market.RequestException("connection refused (simulated offline)")
+            symbol = path.rsplit("/", 1)[-1]
+            if "yahoo" in host and symbol in {"TSLA"}:
+                return FakeResponse(200, json_data=yahoo_payload(symbol))
+            return FakeResponse(403, text="Access Denied")
+
+        client = FakeClient(handler)
+        quote = await market.load_quote(client, "TSLA", "5m", "1d")
+        self.assertEqual(quote.venue, "yahoo")
+        self.assertTrue(any("alpaca" in url for url in seen))
+
+    async def test_prefetch_converts_network_failure_to_market_error(self):
+        """The poll tick must see MarketError, not a network exception."""
+
+        def handler(host: str, path: str, query: str = "") -> FakeResponse:
+            raise market.RequestException("connection refused (simulated offline)")
+
+        client = FakeClient(handler)
+        with self.assertRaises(market.MarketError):
+            await market.prefetch_snapshots(client, ["AAPL", "MSFT"])
+
     async def test_auth_failure_disables_alpaca_and_falls_back_to_yahoo(self):
         seen: list[str] = []
         client = alpaca_feeds(

@@ -17,6 +17,7 @@ from tuistock.config import (
     PanelState,
     config_path,
     default_states,
+    load_alpaca_keys,
     load_layout,
     save_layout,
 )
@@ -319,6 +320,45 @@ class AppTests(TemporaryConfig, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(app.active_panels()), 16)
             for panel in app.active_panels():
                 panel.query_one(ChartBody).render()
+
+
+class AlpacaKeyTests(unittest.TestCase):
+    def test_apca_env_names_are_accepted(self):
+        with patch.dict(os.environ, {
+            "APCA_API_KEY_ID": "apca-key",
+            "APCA_API_SECRET_KEY": "apca-secret",
+            "ALPACA_API_KEY_ID": "",
+            "ALPACA_API_SECRET_KEY": "",
+        }):
+            self.assertEqual(load_alpaca_keys(), ("apca-key", "apca-secret"))
+
+    def test_alpaca_env_names_still_work(self):
+        with patch.dict(os.environ, {
+            "APCA_API_KEY_ID": "",
+            "APCA_API_SECRET_KEY": "",
+            "ALPACA_API_KEY_ID": "alpaca-key",
+            "ALPACA_API_SECRET_KEY": "alpaca-secret",
+        }):
+            self.assertEqual(load_alpaca_keys(), ("alpaca-key", "alpaca-secret"))
+
+    def test_apca_takes_precedence_over_alpaca(self):
+        with patch.dict(os.environ, {
+            "APCA_API_KEY_ID": "apca-key",
+            "APCA_API_SECRET_KEY": "apca-secret",
+            "ALPACA_API_KEY_ID": "alpaca-key",
+            "ALPACA_API_SECRET_KEY": "alpaca-secret",
+        }):
+            self.assertEqual(load_alpaca_keys(), ("apca-key", "apca-secret"))
+
+    def test_no_keys_anywhere_returns_none(self):
+        env = {name: "" for name in (
+            "APCA_API_KEY_ID", "APCA_API_SECRET_KEY",
+            "ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY",
+        )}
+        with patch.dict(os.environ, env), \
+             patch("tuistock.config.alpaca_credentials_path") as path:
+            path.return_value.read_text.side_effect = OSError("missing")
+            self.assertIsNone(load_alpaca_keys())
 
 
 if __name__ == "__main__":
