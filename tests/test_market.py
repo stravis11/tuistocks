@@ -32,7 +32,8 @@ class FakeClient:
 
     async def get(self, url, params=None, headers=None, timeout=None):
         split = urlsplit(url)
-        return self._handler(split.hostname, split.path)
+        query = "&".join(f"{k}={v}" for k, v in sorted((params or {}).items()))
+        return self._handler(split.hostname, split.path, query)
 
     async def aclose(self) -> None:
         pass
@@ -41,7 +42,7 @@ class FakeClient:
 def feeds(seen: list[str], nasdaq: str):
     """Yahoo 429; Nasdaq per `nasdaq`; Coinbase knows ETH-USD and META-USD only."""
 
-    def handler(host: str, path: str) -> FakeResponse:
+    def handler(host: str, path: str, query: str = "") -> FakeResponse:
         seen.append(f"{host}{path}")
         if "yahoo" in host:
             return FakeResponse(429, text="Too Many Requests")
@@ -93,7 +94,7 @@ def yahoo_payload(symbol: str) -> dict:
 def yahoo_feeds(seen: list[str], known: set[str]):
     """Yahoo answers 200 only for symbols in `known`; everything else 404s."""
 
-    def handler(host: str, path: str) -> FakeResponse:
+    def handler(host: str, path: str, query: str = "") -> FakeResponse:
         seen.append(f"{host}{path}")
         if "yahoo" in host:
             symbol = path.rsplit("/", 1)[-1]
@@ -116,6 +117,8 @@ class FeedFallbackTests(unittest.IsolatedAsyncioTestCase):
             patcher = patch.object(market, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        market.configure_alpaca(None)
+        market._ALPACA_SNAPSHOTS.clear()
 
     async def test_blocked_stock_reports_reason_and_stops_retrying(self):
         seen: list[str] = []
@@ -169,6 +172,109 @@ class FeedFallbackTests(unittest.IsolatedAsyncioTestCase):
         requested = [url.rsplit("/", 1)[-1] for url in seen if "yahoo" in url]
         # Dotted is tried on both mirrors before the dashed spelling.
         self.assertEqual(requested, ["BRK.B", "BRK.B", "BRK-B"])
+
+
+ALPACA_BARS = [
+    {"t": "2026-11-11T14:00:00Z", "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 10},
+    {"t": "2026-11-11T14:05:00Z", "o": 100.5, "h": 102, "l": 100, "c": 101, "v": 12},
+]
+ALPACA_SNAPSHOT = {
+    "latestTrade": {"p": 123.45, "t": "2026-11-11T14:06:30Z"},
+    "prevDailyBar": {"c": 120.0},
+    "dailyBar": {"v": 5400},
+}
+
+
+def alpaca_feeds(
+    seen: list[str],
+    *,
+    bars: dict | None = None,
+    snapshots: dict | None = None,
+    bars_status: int = 200,
+    snapshot_status: int = 200,
+    yahoo_known: set[str] | None = None,
+):
+    """Alpaca serves bars/snapshots per arguments; Yahoo per `yahoo_known`."""
+
+    def handler(host: str, path: str, query: str = "") -> FakeResponse:
+        seen.append(f"{host}{path}")
+        if host == "data.alpaca.markets":
+            if path.endswith("/bars"):
+                if bars_status != 200:
+                    return FakeResponse(bars_status, text="denied")
+                return FakeResponse(200, json_data={"bars": bars or {}, "next_page_token": None})
+            if path.endswith("/snapshots"):
+                if snapshot_status != 200:
+                    return FakeResponse(snapshot_status, text="denied")
+                return FakeResponse(200, json_data=snapshots or {})
+        if "yahoo" in host:
+            symbol = path.rsplit("/", 1)[-1]
+            if symbol in (yahoo_known or set()):
+                return FakeResponse(200, json_data=yahoo_payload(symbol))
+            return FakeResponse(404, json_data={"chart": {"error": {"code": "Not Found"}}})
+        return FakeResponse(403, text="Access Denied")
+
+    return FakeClient(handler)
+
+
+class AlpacaFeedTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        market.configure_alpaca(("key-id", "key-secret"))
+        market._ALPACA_SNAPSHOTS.clear()
+
+    async def test_configured_alpaca_serves_stocks_first(self):
+        seen: list[str] = []
+        client = alpaca_feeds(
+            seen,
+            bars={"AAPL": ALPACA_BARS},
+            snapshots={"AAPL": ALPACA_SNAPSHOT},
+        )
+        quote = await market.load_quote(client, "AAPL", "5m", "1d")
+        self.assertEqual(quote.venue, "alpaca")
+        self.assertEqual(quote.price, 123.45)
+        self.assertEqual(quote.previous_close, 120.0)
+        self.assertEqual(quote.session_volume, 5400)
+        self.assertEqual(len(quote.candles), 2)
+
+    async def test_auth_failure_disables_alpaca_and_falls_back_to_yahoo(self):
+        seen: list[str] = []
+        client = alpaca_feeds(
+            seen,
+            bars_status=401,
+            yahoo_known={"AAPL"},
+        )
+        quote = await market.load_quote(client, "AAPL", "5m", "1d")
+        self.assertEqual(quote.venue, "yahoo")
+        alpaca_hits = [url for url in seen if "alpaca" in url]
+        seen.clear()
+        await market.load_quote(client, "AAPL", "5m", "1d")
+        self.assertFalse(
+            any("alpaca" in url for url in seen),
+            "rejected keys should not be retried on the next poll",
+        )
+        self.assertEqual(alpaca_hits, ["data.alpaca.markets/v2/stocks/bars"])
+
+    async def test_prefetch_is_one_batched_request(self):
+        seen: list[str] = []
+        client = alpaca_feeds(seen, snapshots={"AAPL": ALPACA_SNAPSHOT})
+        await market.prefetch_snapshots(client, ["NVDA", "AAPL", "MSFT"])
+        alpaca_urls = [url for url in seen if "alpaca" in url]
+        self.assertEqual(alpaca_urls, ["data.alpaca.markets/v2/stocks/snapshots"])
+
+    async def test_patch_price_reads_prefetched_snapshot_without_request(self):
+        seen: list[str] = []
+        client = alpaca_feeds(seen, snapshots={"AAPL": ALPACA_SNAPSHOT})
+        await market.prefetch_snapshots(client, ["AAPL"])
+        seen.clear()
+        quote = market.Quote(
+            display="AAPL", yahoo="AAPL", is_crypto=False, interval="5m", range_key="1d",
+            candles=[], price=100.0, previous_close=120.0,
+            tz="America/New_York", market_time=0, updated_at=0.0, venue="alpaca",
+        )
+        await market.patch_price(client, quote)
+        self.assertEqual(quote.price, 123.45)
+        self.assertEqual(quote.session_volume, 5400)
+        self.assertEqual(seen, [], "a fresh prefetched snapshot should serve the patch")
 
 
 if __name__ == "__main__":
