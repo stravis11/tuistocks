@@ -93,7 +93,7 @@ Alpaca is the more reliable and better-behaved source: an official API with no b
 
    Alternatively, export `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` (Alpaca's native names, also read: `ALPACA_API_KEY_ID`/`ALPACA_API_SECRET_KEY`).
 
-Invalid keys, or an unreachable API, are detected on the first request and Alpaca is skipped for that request; the app keeps working through the fallback feeds.
+Invalid keys turn Alpaca off for the rest of the session. An unreachable API (dropped connection, silent firewall) puts it on a 60-second cooldown instead — the fallback feeds take over immediately, and Alpaca is retried when the cooldown expires.
 
 ## Tests
 
