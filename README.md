@@ -71,7 +71,29 @@ The grid size and all 16 panel settings are saved in `~/.config/tuistock/layout.
 
 ## Market data
 
-Stocks use Nasdaq's realtime quotes, and Yahoo candles when that feed is available so the volume bars can draw. Crypto uses Coinbase candles and the live trade feed. Multi-day stock charts use daily bars.
+With Alpaca API keys configured, US stocks quote through Alpaca's official Market Data API (real-time IEX feed): batched snapshots for live prices, historical bars for candles. Crypto uses Coinbase candles and the live trade feed.
+
+Without keys — or for tickers Alpaca doesn't cover, like international exchanges — stocks fall back to Yahoo candles and Nasdaq realtime quotes, so the app works out of the box. Multi-day stock charts use daily bars.
+
+### Alpaca API keys (recommended)
+
+Alpaca is the more reliable and better-behaved source: an official API with no bot-protection to trip, and one batched request per poll covers the whole grid. The free plan's 200 req/min limit comfortably fits even a 4×4 layout.
+
+1. Sign up at [app.alpaca.markets](https://app.alpaca.markets) (a paper-trading account is fine).
+2. Generate an API key on the dashboard (**API Keys → Generate New Key**). The secret is shown only once.
+3. Save the keys to `~/.config/tuistock/alpaca.json`:
+
+   ```bash
+   mkdir -p ~/.config/tuistock
+   cat > ~/.config/tuistock/alpaca.json <<'EOF'
+   {"key_id": "YOUR_KEY_ID", "secret_key": "YOUR_SECRET_KEY"}
+   EOF
+   chmod 600 ~/.config/tuistock/alpaca.json
+   ```
+
+   Alternatively, export `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET_KEY`.
+
+Invalid keys are detected on the first request and Alpaca is skipped for the session; the app keeps working through the fallback feeds.
 
 ## Tests
 
