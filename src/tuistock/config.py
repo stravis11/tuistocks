@@ -73,9 +73,19 @@ def alpaca_credentials_path() -> Path:
 
 
 def load_alpaca_keys() -> tuple[str, str] | None:
-    """Alpaca API keys from the environment or ~/.config/tuistock/alpaca.json."""
-    key_id = os.environ.get("ALPACA_API_KEY_ID", "").strip()
-    secret = os.environ.get("ALPACA_API_SECRET_KEY", "").strip()
+    """Alpaca API keys from the environment or ~/.config/tuistock/alpaca.json.
+
+    Accepts both Alpaca's native names (APCA_API_KEY_ID/APCA_API_SECRET_KEY,
+    used by their own tools) and the ALPACA_* spellings.
+    """
+    key_id = (
+        os.environ.get("APCA_API_KEY_ID", "").strip()
+        or os.environ.get("ALPACA_API_KEY_ID", "").strip()
+    )
+    secret = (
+        os.environ.get("APCA_API_SECRET_KEY", "").strip()
+        or os.environ.get("ALPACA_API_SECRET_KEY", "").strip()
+    )
     if key_id and secret:
         return key_id, secret
     try:

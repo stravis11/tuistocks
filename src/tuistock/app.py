@@ -619,7 +619,9 @@ class TrackerApp(App):
             if symbols:
                 try:
                     await prefetch_snapshots(self._client, symbols)
-                except MarketError:
+                except Exception:
+                    # A dead batched request must never cancel the refresh:
+                    # panels fall back per-symbol and crypto keeps ticking.
                     pass
         results = await asyncio.gather(
             *(self._refresh_panel(panel, full=full) for panel in panels)

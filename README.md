@@ -91,9 +91,9 @@ Alpaca is the more reliable and better-behaved source: an official API with no b
    chmod 600 ~/.config/tuistock/alpaca.json
    ```
 
-   Alternatively, export `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET_KEY`.
+   Alternatively, export `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` (Alpaca's native names, also read: `ALPACA_API_KEY_ID`/`ALPACA_API_SECRET_KEY`).
 
-Invalid keys are detected on the first request and Alpaca is skipped for the session; the app keeps working through the fallback feeds.
+Invalid keys, or an unreachable API, are detected on the first request and Alpaca is skipped for that request; the app keeps working through the fallback feeds.
 
 ## Tests
 
