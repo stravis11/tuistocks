@@ -188,18 +188,32 @@ _ALPACA_MAX_PAGES = 5
 _alpaca_keys: tuple[str, str] | None = None
 # Bad keys (401/403) will not fix themselves mid-session; stop asking.
 _alpaca_disabled = False
+# A network failure (dropped connection, silent firewall) is usually brief.
+# Cool down instead of paying the 8s timeout on every request of every tick.
+_ALPACA_DOWN_SECONDS = 60
+_alpaca_down_until = 0.0
 _ALPACA_SNAPSHOT_TTL = 8.0
 _ALPACA_SNAPSHOTS: dict[str, tuple[float, dict]] = {}
 
 
 def configure_alpaca(keys: tuple[str, str] | None) -> None:
-    global _alpaca_keys, _alpaca_disabled
+    global _alpaca_keys, _alpaca_disabled, _alpaca_down_until
     _alpaca_keys = keys
     _alpaca_disabled = False
+    _alpaca_down_until = 0.0
 
 
 def alpaca_enabled() -> bool:
-    return _alpaca_keys is not None and not _alpaca_disabled
+    return (
+        _alpaca_keys is not None
+        and not _alpaca_disabled
+        and time.monotonic() >= _alpaca_down_until
+    )
+
+
+def _trip_alpaca_down() -> None:
+    global _alpaca_down_until
+    _alpaca_down_until = time.monotonic() + _ALPACA_DOWN_SECONDS
 
 
 def _alpaca_headers() -> dict:
@@ -229,6 +243,7 @@ async def prefetch_snapshots(client: MarketClientProtocol, symbols: list[str]) -
             headers=_alpaca_headers(),
         )
     except _HTTP_ERRORS as exc:
+        _trip_alpaca_down()
         raise MarketError("data unavailable") from exc
     _reject_alpaca_auth(response)
     if response.status_code == 429:
@@ -265,6 +280,7 @@ async def _alpaca_snapshot(client: MarketClientProtocol, display: str) -> dict:
             headers=_alpaca_headers(),
         )
     except _HTTP_ERRORS as exc:
+        _trip_alpaca_down()
         raise MarketError("data unavailable") from exc
     _reject_alpaca_auth(response)
     if response.status_code == 429:
@@ -317,6 +333,7 @@ async def _alpaca_quote(
                 f"{_ALPACA_BASE}/v2/stocks/bars", params=params, headers=_alpaca_headers()
             )
         except _HTTP_ERRORS as exc:
+            _trip_alpaca_down()
             raise MarketError("data unavailable") from exc
         _reject_alpaca_auth(response)
         if response.status_code == 429:

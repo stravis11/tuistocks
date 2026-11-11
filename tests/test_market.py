@@ -264,6 +264,39 @@ class AlpacaFeedTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(market.MarketError):
             await market.prefetch_snapshots(client, ["AAPL", "MSFT"])
 
+    async def test_network_failure_cooldowns_alpaca_temporarily(self):
+        """After a network failure, fallback is immediate until the cooldown ends."""
+        seen: list[str] = []
+
+        def handler(host: str, path: str, query: str = "") -> FakeResponse:
+            seen.append(f"{host}{path}")
+            if host == "data.alpaca.markets":
+                raise market.RequestException("connection refused (simulated offline)")
+            symbol = path.rsplit("/", 1)[-1]
+            if "yahoo" in host and symbol == "TSLA":
+                return FakeResponse(200, json_data=yahoo_payload(symbol))
+            return FakeResponse(403, text="Access Denied")
+
+        client = FakeClient(handler)
+        quote = await market.load_quote(client, "TSLA", "5m", "1d")
+        self.assertEqual(quote.venue, "yahoo")
+        alpaca_hits = sum("alpaca" in url for url in seen)
+        seen.clear()
+        # Still inside the cooldown: no Alpaca attempt at all.
+        self.assertFalse(market.alpaca_enabled())
+        quote = await market.load_quote(client, "TSLA", "5m", "1d")
+        self.assertEqual(quote.venue, "yahoo")
+        self.assertFalse(any("alpaca" in url for url in seen))
+        self.assertEqual(sum("alpaca" in url for url in seen), 0)
+        self.assertEqual(
+            alpaca_hits, 1, "only the first poll should pay the network timeout"
+        )
+        # Cooldown expired: Alpaca is retried.
+        market._alpaca_down_until = 0.0
+        seen.clear()
+        await market.load_quote(client, "TSLA", "5m", "1d")
+        self.assertTrue(any("alpaca" in url for url in seen))
+
     async def test_auth_failure_disables_alpaca_and_falls_back_to_yahoo(self):
         seen: list[str] = []
         client = alpaca_feeds(
