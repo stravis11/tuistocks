@@ -8,7 +8,6 @@ import json
 import time
 from datetime import datetime
 
-import httpx
 import websockets
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -32,8 +31,8 @@ from tuistock.config import (
     save_layout,
 )
 from tuistock.market import (
-    HEADERS,
     INTERVAL_SECONDS,
+    MarketClient,
     MarketError,
     Quote,
     RateLimit,
@@ -415,7 +414,7 @@ class TrackerApp(App):
         self.states = list(states[:MAX_PANELS])
         self.states.extend(default_states()[len(self.states):])
         self.grid_size = grid_size
-        self._client: httpx.AsyncClient | None = None
+        self._client: MarketClient | None = None
         self._poll_seconds = 4.0
         self._poll_tick = 0
         self._stream_gen = 0
@@ -433,11 +432,7 @@ class TrackerApp(App):
         yield StatusBar()
 
     def on_mount(self) -> None:
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(8.0, connect=5.0),
-            headers=HEADERS,
-            follow_redirects=True,
-        )
+        self._client = MarketClient()
         self.query_one("#p0", ChartPanel).focus()
         self.run_worker(
             self._poll_loop(),

@@ -7,9 +7,12 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
-import httpx
+from curl_cffi import CurlError
+from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException
 
 from tuistock.config import clamp_range
 
@@ -101,6 +104,59 @@ def resolve_symbol(raw: str) -> tuple[str, str, bool]:
 
 
 _ET = ZoneInfo("America/New_York")
+
+# Both network-level curl failures and HTTP-layer failures surface to the
+# quote loaders as "data unavailable"; keep them in one tuple.
+_HTTP_ERRORS: tuple[type[Exception], ...] = (CurlError, RequestException)
+
+
+class MarketClient:
+    """Async HTTP client that presents a Chrome TLS fingerprint.
+
+    Yahoo and Nasdaq both block generic Python HTTP stacks by TLS fingerprint
+    (Yahoo answers 429 and Nasdaq's Akamai edge 403 even when the headers
+    match a browser), so requests go through curl_cffi impersonating Chrome.
+    """
+
+    def __init__(self, timeout: float = 8.0) -> None:
+        self._session = AsyncSession(impersonate="chrome", timeout=timeout)
+
+    async def get(
+        self,
+        url: str,
+        *,
+        params: dict | None = None,
+        headers: dict | None = None,
+        timeout: float | None = None,
+    ):
+        kwargs: dict = {}
+        if params:
+            kwargs["params"] = params
+        if headers:
+            kwargs["headers"] = headers
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return await self._session.get(url, **kwargs)
+
+    async def aclose(self) -> None:
+        await self._session.close()
+
+
+class MarketClientProtocol(Protocol):
+    """The GET/Close surface the feed loaders need; tests fake this."""
+
+    async def get(
+        self,
+        url: str,
+        *,
+        params: dict | None = None,
+        headers: dict | None = None,
+        timeout: float | None = None,
+    ) -> Any: ...
+
+    async def aclose(self) -> None: ...
+
+
 _NASDAQ_HEADERS = {
     **HEADERS,
     "Origin": "https://www.nasdaq.com",
@@ -153,7 +209,7 @@ def apply_trade(quote: Quote, price: float, volume: float | None = None) -> None
 
 
 async def load_quote(
-    client: httpx.AsyncClient,
+    client: MarketClientProtocol,
     raw_symbol: str,
     interval: str,
     range_key: str,
@@ -189,7 +245,7 @@ async def load_quote(
             raise first from None
 
 
-async def patch_price(client: httpx.AsyncClient, quote: Quote) -> None:
+async def patch_price(client: MarketClientProtocol, quote: Quote) -> None:
     if quote.venue == "coinbase":
         response = await client.get(
             f"https://api.exchange.coinbase.com/products/{quote.yahoo}/ticker"
@@ -216,7 +272,7 @@ async def patch_price(client: httpx.AsyncClient, quote: Quote) -> None:
 
 
 async def _coinbase_quote(
-    client: httpx.AsyncClient,
+    client: MarketClientProtocol,
     display: str,
     product: str,
     interval: str,
@@ -257,7 +313,7 @@ async def _coinbase_quote(
     )
 
 
-async def _coinbase_stats(client: httpx.AsyncClient, product: str) -> dict:
+async def _coinbase_stats(client: MarketClientProtocol, product: str) -> dict:
     response = await client.get(f"https://api.exchange.coinbase.com/products/{product}/stats")
     if response.status_code == 429:
         raise RateLimit("rate limited")
@@ -273,7 +329,7 @@ async def _coinbase_stats(client: httpx.AsyncClient, product: str) -> dict:
 
 
 async def _coinbase_candles(
-    client: httpx.AsyncClient,
+    client: MarketClientProtocol,
     product: str,
     granularity: int,
     start: int,
@@ -332,7 +388,7 @@ def _yahoo_span(interval: str, range_key: str) -> str:
 
 
 async def _yahoo_quote(
-    client: httpx.AsyncClient,
+    client: MarketClientProtocol,
     display: str,
     interval: str,
     range_key: str,
@@ -346,10 +402,12 @@ async def _yahoo_quote(
         "includePrePost": "true",
     }
     last_error: MarketError = MarketError(f"No data for {display}")
+    # Yahoo spells share-class tickers with a dash (BRK-B), Nasdaq with a dot.
+    symbol = display.replace(".", "-")
     for template in _YAHOO_URLS:
         try:
-            response = await client.get(template.format(symbol=display), params=params)
-        except httpx.HTTPError as exc:
+            response = await client.get(template.format(symbol=symbol), params=params)
+        except _HTTP_ERRORS as exc:
             last_error = MarketError("data unavailable")
             continue
         if response.status_code == 429:
@@ -435,7 +493,7 @@ def _at(values: list, index: int) -> float | None:
 
 
 async def _nasdaq_quote(
-    client: httpx.AsyncClient,
+    client: MarketClientProtocol,
     display: str,
     interval: str,
     range_key: str,
@@ -494,7 +552,7 @@ async def _nasdaq_quote(
     )
 
 
-async def _asset_class(client: httpx.AsyncClient, symbol: str) -> str:
+async def _asset_class(client: MarketClientProtocol, symbol: str) -> str:
     cached = _ASSET_CLASS.get(symbol)
     if cached:
         return cached
@@ -518,13 +576,13 @@ async def _asset_class(client: httpx.AsyncClient, symbol: str) -> str:
     raise last_error
 
 
-async def _nasdaq_json(client: httpx.AsyncClient, url: str) -> dict:
+async def _nasdaq_json(client: MarketClientProtocol, url: str) -> dict:
     global _nasdaq_blocked_until
     if time.monotonic() < _nasdaq_blocked_until:
         raise Blocked("Nasdaq blocked (403)")
     try:
         response = await client.get(url, headers=_NASDAQ_HEADERS)
-    except httpx.HTTPError as exc:
+    except _HTTP_ERRORS as exc:
         raise MarketError("data unavailable") from exc
     if response.status_code == 429:
         raise RateLimit("rate limited")
