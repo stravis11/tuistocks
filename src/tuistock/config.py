@@ -66,6 +66,31 @@ def config_path() -> Path:
     return root / "tuistock" / "layout.json"
 
 
+def alpaca_credentials_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(base) if base else Path.home() / ".config"
+    return root / "tuistock" / "alpaca.json"
+
+
+def load_alpaca_keys() -> tuple[str, str] | None:
+    """Alpaca API keys from the environment or ~/.config/tuistock/alpaca.json."""
+    key_id = os.environ.get("ALPACA_API_KEY_ID", "").strip()
+    secret = os.environ.get("ALPACA_API_SECRET_KEY", "").strip()
+    if key_id and secret:
+        return key_id, secret
+    try:
+        payload = json.loads(alpaca_credentials_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    key_id = str(payload.get("key_id", "")).strip()
+    secret = str(payload.get("secret_key", "")).strip()
+    if key_id and secret:
+        return key_id, secret
+    return None
+
+
 def default_states() -> list[PanelState]:
     return [PanelState(symbol, interval, range_key) for symbol, interval, range_key in DEFAULTS]
 

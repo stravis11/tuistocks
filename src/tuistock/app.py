@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
 import time
 from datetime import datetime
 
@@ -27,6 +28,7 @@ from tuistock.config import (
     allowed_ranges,
     clamp_range,
     default_states,
+    load_alpaca_keys,
     load_layout,
     save_layout,
 )
@@ -36,10 +38,13 @@ from tuistock.market import (
     MarketError,
     Quote,
     RateLimit,
+    alpaca_enabled,
     apply_trade,
+    configure_alpaca,
     load_quote,
     normalize_symbol,
     patch_price,
+    prefetch_snapshots,
     resolve_symbol,
 )
 
@@ -433,6 +438,7 @@ class TrackerApp(App):
 
     def on_mount(self) -> None:
         self._client = MarketClient()
+        configure_alpaca(load_alpaca_keys())
         self.query_one("#p0", ChartPanel).focus()
         self.run_worker(
             self._poll_loop(),
@@ -596,12 +602,25 @@ class TrackerApp(App):
             except Exception:
                 self._poll_seconds = min(30.0, self._poll_seconds * 1.5)
             elapsed = time.monotonic() - started
-            await asyncio.sleep(max(0.2, self._poll_seconds - elapsed))
+            # Jitter so a grid of panels does not produce a perfectly periodic
+            # request pattern.
+            await asyncio.sleep(max(0.2, self._poll_seconds - elapsed) * random.uniform(0.85, 1.1))
 
     async def _refresh_all(self) -> None:
         full = self._poll_tick % 4 == 0
         self._poll_tick += 1
         panels = self.active_panels()
+        if alpaca_enabled() and self._client is not None:
+            # One batched snapshot per tick feeds every stock panel's price
+            # patch; crypto panels stay on Coinbase.
+            symbols = sorted(
+                {panel.symbol for panel in panels if not resolve_symbol(panel.symbol)[2]}
+            )
+            if symbols:
+                try:
+                    await prefetch_snapshots(self._client, symbols)
+                except MarketError:
+                    pass
         results = await asyncio.gather(
             *(self._refresh_panel(panel, full=full) for panel in panels)
         )

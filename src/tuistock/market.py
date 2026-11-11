@@ -178,6 +178,195 @@ _YAHOO_URLS = (
 )
 _RANGE_SECONDS = {"1d": 86_400, "5d": 5 * 86_400, "1mo": 31 * 86_400, "6mo": 183 * 86_400, "1y": 366 * 86_400}
 
+# Alpaca is the primary stock feed when API keys are configured: it is an
+# official paid/entitled API, so no bot protection to outsmart, and the free
+# plan's 200 req/min comfortably fits a batched-snapshot poll per tick.
+_ALPACA_BASE = "https://data.alpaca.markets"
+_ALPACA_TIMEFRAMES = {"1m": "1Min", "5m": "5Min", "15m": "15Min", "1h": "1Hour", "1d": "1Day"}
+_ALPACA_RANGE_DAYS = {"1d": 5, "5d": 7, "1mo": 35, "6mo": 190, "1y": 370}
+_ALPACA_MAX_PAGES = 5
+_alpaca_keys: tuple[str, str] | None = None
+# Bad keys (401/403) will not fix themselves mid-session; stop asking.
+_alpaca_disabled = False
+_ALPACA_SNAPSHOT_TTL = 8.0
+_ALPACA_SNAPSHOTS: dict[str, tuple[float, dict]] = {}
+
+
+def configure_alpaca(keys: tuple[str, str] | None) -> None:
+    global _alpaca_keys, _alpaca_disabled
+    _alpaca_keys = keys
+    _alpaca_disabled = False
+
+
+def alpaca_enabled() -> bool:
+    return _alpaca_keys is not None and not _alpaca_disabled
+
+
+def _alpaca_headers() -> dict:
+    assert _alpaca_keys is not None
+    key_id, secret = _alpaca_keys
+    return {"APCA-API-KEY-ID": key_id, "APCA-API-SECRET-KEY": secret}
+
+
+def _reject_alpaca_auth(response) -> None:
+    global _alpaca_disabled
+    if response.status_code in (401, 403):
+        _alpaca_disabled = True
+
+
+async def prefetch_snapshots(client: MarketClientProtocol, symbols: list[str]) -> None:
+    """Fetch latest trades for many tickers in one request and cache them.
+
+    Called once per poll tick so per-panel price patches read the cache
+    instead of sending one request per panel.
+    """
+    if not symbols:
+        return
+    response = await client.get(
+        f"{_ALPACA_BASE}/v2/stocks/snapshots",
+        params={"symbols": ",".join(sorted(set(symbols))), "feed": "iex"},
+        headers=_alpaca_headers(),
+    )
+    _reject_alpaca_auth(response)
+    if response.status_code == 429:
+        raise RateLimit("rate limited")
+    if response.status_code >= 400:
+        raise MarketError("data unavailable")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise MarketError("data unavailable") from exc
+    if not isinstance(payload, dict):
+        raise MarketError("data unavailable")
+    now = time.time()
+    for symbol, snapshot in payload.items():
+        if isinstance(snapshot, dict):
+            _ALPACA_SNAPSHOTS[str(symbol).upper()] = (now, snapshot)
+
+
+def _cached_alpaca_snapshot(display: str) -> dict | None:
+    entry = _ALPACA_SNAPSHOTS.get(display.upper())
+    if entry is None or time.time() - entry[0] > _ALPACA_SNAPSHOT_TTL:
+        return None
+    return entry[1]
+
+
+async def _alpaca_snapshot(client: MarketClientProtocol, display: str) -> dict:
+    cached = _cached_alpaca_snapshot(display)
+    if cached is not None:
+        return cached
+    response = await client.get(
+        f"{_ALPACA_BASE}/v2/stocks/snapshots",
+        params={"symbols": display.upper(), "feed": "iex"},
+        headers=_alpaca_headers(),
+    )
+    _reject_alpaca_auth(response)
+    if response.status_code == 429:
+        raise RateLimit("rate limited")
+    if response.status_code >= 400:
+        raise MarketError("data unavailable")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise MarketError("data unavailable") from exc
+    snapshot = (payload or {}).get(display.upper())
+    if not isinstance(snapshot, dict):
+        raise MarketError(f"No data for {display}")
+    _ALPACA_SNAPSHOTS[display.upper()] = (time.time(), snapshot)
+    return snapshot
+
+
+def _epoch(ts_text: str) -> int:
+    try:
+        return int(datetime.strptime(ts_text[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=ZoneInfo("UTC")).timestamp())
+    except (TypeError, ValueError):
+        return int(time.time())
+
+
+async def _alpaca_quote(
+    client: MarketClientProtocol,
+    display: str,
+    interval: str,
+    range_key: str,
+) -> Quote:
+    timeframe = _ALPACA_TIMEFRAMES[interval]
+    days = _ALPACA_RANGE_DAYS.get(range_key, 370)
+    end = datetime.now(ZoneInfo("UTC"))
+    start = end - timedelta(days=days)
+    candles: list[Candle] = []
+    page_token: str | None = None
+    for _ in range(_ALPACA_MAX_PAGES):
+        params: dict = {
+            "symbols": display.upper(),
+            "timeframe": timeframe,
+            "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": "10000",
+            "feed": "iex",
+        }
+        if page_token:
+            params["page_token"] = page_token
+        response = await client.get(
+            f"{_ALPACA_BASE}/v2/stocks/bars", params=params, headers=_alpaca_headers()
+        )
+        _reject_alpaca_auth(response)
+        if response.status_code == 429:
+            raise RateLimit("rate limited")
+        if response.status_code >= 400:
+            raise MarketError(f"No data for {display}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise MarketError("data unavailable") from exc
+        rows = ((payload.get("bars") or {}).get(display.upper())) or []
+        for row in rows:
+            if not isinstance(row, dict) or row.get("t") is None:
+                continue
+            close = row.get("c")
+            if close is None:
+                continue
+            candles.append(
+                Candle(
+                    ts=_epoch(str(row["t"])),
+                    open=float(row.get("o") or close),
+                    high=float(row.get("h") or close),
+                    low=float(row.get("l") or close),
+                    close=float(close),
+                    volume=float(row.get("v") or 0),
+                )
+            )
+        page_token = payload.get("next_page_token")
+        if not page_token:
+            break
+    if len(candles) < 2:
+        raise MarketError(f"No data for {display}")
+    candles.sort(key=lambda candle: candle.ts)
+    snapshot = await _alpaca_snapshot(client, display)
+    trade = snapshot.get("latestTrade") or {}
+    price = float(trade["p"]) if trade.get("p") is not None else candles[-1].close
+    previous_bar = snapshot.get("prevDailyBar") or {}
+    previous = float(previous_bar["c"]) if previous_bar.get("c") is not None else candles[0].open
+    daily = snapshot.get("dailyBar") or {}
+    session_volume = float(daily["v"]) if daily.get("v") is not None else 0.0
+    candles[-1].close = price
+    candles[-1].high = max(candles[-1].high, price)
+    candles[-1].low = min(candles[-1].low, price)
+    return Quote(
+        display=display,
+        yahoo=display,
+        is_crypto=False,
+        interval=interval,
+        range_key=range_key,
+        candles=candles,
+        price=price,
+        previous_close=previous,
+        tz="America/New_York",
+        market_time=_epoch(str(trade.get("t"))) if trade.get("t") else candles[-1].ts,
+        updated_at=time.time(),
+        venue="alpaca",
+        session_volume=session_volume,
+    )
+
 
 def apply_trade(quote: Quote, price: float, volume: float | None = None) -> None:
     """Move the live price onto the current candle."""
@@ -227,6 +416,13 @@ async def load_quote(
             except MarketError:
                 raise first from None
     try:
+        if alpaca_enabled():
+            try:
+                return await _alpaca_quote(client, display, interval, range_key)
+            except RateLimit:
+                pass
+            except MarketError:
+                pass
         return await _yahoo_quote(client, display, interval, range_key)
     except RateLimit:
         pass
@@ -257,6 +453,24 @@ async def patch_price(client: MarketClientProtocol, quote: Quote) -> None:
         payload = response.json()
         apply_trade(quote, float(payload["price"]))
         return
+    if alpaca_enabled() and quote.venue in {"alpaca", "yahoo"}:
+        # Price patches come from the batched snapshot prefetch; Nasdaq is
+        # only hit if Alpaca has nothing for this ticker.
+        try:
+            snapshot = await _alpaca_snapshot(client, quote.display)
+            trade = snapshot.get("latestTrade") or {}
+            if trade.get("p") is not None:
+                daily = snapshot.get("dailyBar") or {}
+                apply_trade(
+                    quote,
+                    float(trade["p"]),
+                    float(daily["v"]) if daily.get("v") is not None else None,
+                )
+                return
+        except RateLimit:
+            raise
+        except MarketError:
+            pass
     asset = quote.venue.split(":", 1)[1] if quote.venue.startswith("nasdaq:") else None
     if asset not in {"stocks", "etf"}:
         asset = await _asset_class(client, quote.display)
