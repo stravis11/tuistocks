@@ -75,6 +75,10 @@ With Alpaca API keys configured, US stocks quote through Alpaca's official Marke
 
 Without keys — or for tickers Alpaca doesn't cover, like international exchanges — stocks fall back to Yahoo candles and Nasdaq realtime quotes, so the app works out of the box. Multi-day stock charts use daily bars.
 
+Outside regular US market hours, Yahoo takes priority so prices and intraday charts include the broader premarket and after-hours sessions. The headline price uses the newest available timestamp rather than overwriting extended-hours bars with the regular close. Daily charts also fetch an intraday quote for the latest extended-hours price.
+
+Stock panels label the latest price `PREMARKET` or `AFTER-HOURS`. Intraday charts shade extended-hours columns in amber with an `EXT: shaded` legend. The footer shows the price timestamp; an old trade does not become a fresh trade just because it was polled again. If Yahoo is unavailable, fallback panels report limited IEX coverage or unavailable extended-hours coverage. Overnight trading is not supported. Session boundaries use Yahoo's supplied schedule when available, otherwise standard US hours in Eastern time; other exchanges retain their normal presentation.
+
 ### Alpaca API keys (recommended)
 
 Alpaca is the more reliable and better-behaved source: an official API with no bot-protection to trip, and one batched request per poll covers the whole grid. The free plan's 200 req/min limit comfortably fits even a 4×4 layout.

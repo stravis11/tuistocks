@@ -85,6 +85,8 @@ class PanelHead(Widget):
         left.append("⌕ ", style="#5c7078")
         left.append(symbol, style="bold #f4f8f8")
         if quote is not None:
+            if quote.session != "regular":
+                left.append(f" {quote.session.upper()}", style="bold #ffb067")
             change, change_style = fmt_change(quote.price, quote.previous_close)
             left.append("   ")
             left.append(change, style=change_style)
@@ -135,6 +137,7 @@ class ChartBody(Widget):
             price=quote.price,
             previous_close=quote.previous_close,
             session_volume=quote.session_volume,
+            extended_sessions=not quote.is_crypto and quote.interval != "1d",
         )
 
     @property
@@ -181,9 +184,12 @@ class PanelFoot(Widget):
             left.append("  ")
             left.append(quote.note, style="#7d919a")
         right = Text()
+        if quote is not None and not quote.is_crypto:
+            stamp = datetime.fromtimestamp(quote.market_time).astimezone().strftime("%H:%M")
+            right.append(f"as of {stamp} ", style="#7d919a")
         if quote is None:
             right.append("○", style="#5c7078")
-        elif time.time() - quote.updated_at < 12:
+        elif time.time() - (quote.updated_at if quote.is_crypto else quote.market_time) < 60:
             right.append("●", style="#3ee07a")
         else:
             right.append("●", style="#e0a050")
@@ -298,7 +304,7 @@ class StatusBar(Widget):
         width = max(0, self.size.width)
         now = datetime.now().astimezone().strftime("%H:%M:%S")
         ages = [
-            time.time() - panel.quote.updated_at
+            time.time() - (panel.quote.updated_at if panel.quote.is_crypto else panel.quote.market_time)
             for panel in app.active_panels()
             if panel.quote is not None
         ]

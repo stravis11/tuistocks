@@ -140,6 +140,7 @@ def render_chart(
     price: float | None,
     previous_close: float | None,
     session_volume: float = 0.0,
+    extended_sessions: bool = False,
 ) -> Text:
     if width < 16 or height < 6 or len(candles) < 2:
         return _message(width, height, "waiting for bars", AXIS_STYLE)
@@ -209,6 +210,15 @@ def render_chart(
     _stamp_labels(cells, plot_w, candles, sma, session_volume)
     _draw_axis(cells, price_h, plot_w, gap, axis_w, ymin, span, y_of, badge)
     _draw_times(cells, candles, plot_w)
+    if extended_sessions:
+        for col in range(plot_w):
+            candle = candles[round(col * (len(candles) - 1) / max(1, plot_w - 1))]
+            if candle.session != "regular":
+                for row in range(price_h):
+                    char, style = cells[row][col]
+                    cells[row][col] = (char, (style or AXIS_STYLE) + " on #30251c")
+        if any(c.session != "regular" for c in candles):
+            _write(cells, 0, 0, "EXT: shaded", "bold #ffb067 on #30251c")
     return _to_text(cells)
 
 

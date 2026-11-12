@@ -58,6 +58,7 @@ class Candle:
     low: float
     close: float
     volume: float
+    session: str = "regular"
 
 
 @dataclass
@@ -76,6 +77,7 @@ class Quote:
     venue: str
     session_volume: float = 0.0
     note: str | None = None
+    session: str = "regular"
 
 
 def normalize_symbol(raw: str) -> str:
@@ -104,6 +106,30 @@ def resolve_symbol(raw: str) -> tuple[str, str, bool]:
 
 
 _ET = ZoneInfo("America/New_York")
+
+
+def stock_session(ts: int, tz: str = "America/New_York", periods: dict | None = None) -> str:
+    """Classify data by its timestamp, using provider session boundaries when available."""
+    if periods:
+        for key, label in (("pre", "premarket"), ("regular", "regular"), ("post", "after-hours")):
+            period = periods.get(key) or {}
+            if period.get("start", 0) <= ts < period.get("end", 0):
+                return label
+    if tz != "America/New_York":
+        return "regular"
+    local = datetime.fromtimestamp(ts, _ET)
+    minute = local.hour * 60 + local.minute
+    if local.weekday() < 5:
+        if 240 <= minute < 570:
+            return "premarket"
+        if 960 <= minute < 1200:
+            return "after-hours"
+    return "regular"
+
+
+def prefer_extended_feed() -> bool:
+    local = datetime.now(_ET)
+    return local.weekday() >= 5 or not (570 <= local.hour * 60 + local.minute < 960)
 
 # Both network-level curl failures and HTTP-layer failures surface to the
 # quote loaders as "data unavailable"; keep them in one tuple.
@@ -359,6 +385,7 @@ async def _alpaca_quote(
                     low=float(row.get("l") or close),
                     close=float(close),
                     volume=float(row.get("v") or 0),
+                    session=stock_session(_epoch(str(row["t"]))) if interval != "1d" else "regular",
                 )
             )
         page_token = payload.get("next_page_token")
@@ -390,13 +417,18 @@ async def _alpaca_quote(
         market_time=_epoch(str(trade.get("t"))) if trade.get("t") else candles[-1].ts,
         updated_at=time.time(),
         venue="alpaca",
+        session=stock_session(_epoch(str(trade["t"]))) if trade.get("t") else "regular",
+        note="IEX coverage limited" if prefer_extended_feed() else None,
         session_volume=session_volume,
     )
 
 
-def apply_trade(quote: Quote, price: float, volume: float | None = None) -> None:
+def apply_trade(quote: Quote, price: float, volume: float | None = None, *, timestamp: int | None = None) -> None:
     """Move the live price onto the current candle."""
-    now = int(time.time())
+    now = int(time.time()) if timestamp is None else timestamp
+    if now < quote.market_time:
+        return
+    quote.session = "regular" if quote.is_crypto else stock_session(now, quote.tz)
     quote.price = price
     quote.market_time = now
     quote.updated_at = time.time()
@@ -404,7 +436,7 @@ def apply_trade(quote: Quote, price: float, volume: float | None = None) -> None
         quote.session_volume = volume
     bucket = INTERVAL_SECONDS.get(quote.interval, 60)
     if not quote.candles:
-        quote.candles.append(Candle(now, price, price, price, price, 0.0))
+        quote.candles.append(Candle(now, price, price, price, price, 0.0, quote.session))
         return
     last = quote.candles[-1]
     if quote.interval == "1d":
@@ -418,7 +450,7 @@ def apply_trade(quote: Quote, price: float, volume: float | None = None) -> None
         last.high = max(last.high, price)
         last.low = min(last.low, price)
         return
-    quote.candles.append(Candle(open_ts, price, price, price, price, 0.0))
+    quote.candles.append(Candle(open_ts, price, price, price, price, 0.0, quote.session))
     if len(quote.candles) > 4000:
         del quote.candles[:-3000]
 
@@ -441,6 +473,12 @@ async def load_quote(
                 return await _nasdaq_quote(client, display, interval, range_key)
             except MarketError:
                 raise first from None
+    extended = prefer_extended_feed()
+    if extended:
+        try:
+            return await _yahoo_quote(client, display, interval, range_key)
+        except MarketError:
+            pass
     try:
         if alpaca_enabled():
             try:
@@ -449,7 +487,8 @@ async def load_quote(
                 pass
             except MarketError:
                 pass
-        return await _yahoo_quote(client, display, interval, range_key)
+        if not extended:
+            return await _yahoo_quote(client, display, interval, range_key)
     except RateLimit:
         pass
     except MarketError:
@@ -468,6 +507,13 @@ async def load_quote(
 
 
 async def patch_price(client: MarketClientProtocol, quote: Quote) -> None:
+    if not quote.is_crypto and (quote.venue == "yahoo" or prefer_extended_feed()):
+        # Refresh candles and price together; never paint a stale IEX/Nasdaq
+        # close into a newer extended-hours candle.
+        fresh = await _yahoo_quote(client, quote.display, quote.interval, quote.range_key)
+        if fresh.market_time >= quote.market_time:
+            quote.__dict__.update(fresh.__dict__)
+        return
     if quote.venue == "coinbase":
         response = await client.get(
             f"https://api.exchange.coinbase.com/products/{quote.yahoo}/ticker"
@@ -491,6 +537,7 @@ async def patch_price(client: MarketClientProtocol, quote: Quote) -> None:
                     quote,
                     float(trade["p"]),
                     float(daily["v"]) if daily.get("v") is not None else None,
+                    timestamp=_epoch(str(trade["t"])) if trade.get("t") else quote.market_time,
                 )
                 return
         except RateLimit:
@@ -668,7 +715,27 @@ async def _yahoo_quote(
                 last_error = MarketError("data unavailable")
                 continue
             try:
-                return _parse_yahoo(payload, display, interval, range_key)
+                result = _parse_yahoo(payload, display, interval, range_key)
+                if interval == "1d":
+                    try:
+                        latest = await _yahoo_quote(client, display, "5m", "1d")
+                    except MarketError:
+                        result.note = "Extended hours unavailable"
+                        return result
+                    if latest.market_time >= result.market_time:
+                        result.price = latest.price
+                        result.market_time = latest.market_time
+                        result.session = latest.session
+                        if datetime.fromtimestamp(result.candles[-1].ts, _ET).date() == datetime.fromtimestamp(latest.market_time, _ET).date():
+                            last = result.candles[-1]
+                            last.close = latest.price
+                            last.high = max(last.high, latest.price)
+                            last.low = min(last.low, latest.price)
+                        else:
+                            local = datetime.fromtimestamp(latest.market_time, _ET)
+                            day = int(local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+                            result.candles.append(Candle(day, latest.price, latest.price, latest.price, latest.price, 0))
+                return result
             except MarketError as exc:
                 last_error = exc
     raise last_error
@@ -684,6 +751,8 @@ def _parse_yahoo(payload: dict, display: str, interval: str, range_key: str) -> 
     meta = block.get("meta") or {}
     if meta.get("instrumentType") == "CRYPTOCURRENCY":
         raise MarketError(f"No data for {display}")
+    tz = str(meta.get("exchangeTimezoneName") or "America/New_York")
+    periods = meta.get("currentTradingPeriod") or {}
     timestamps = block.get("timestamp") or []
     quote = ((block.get("indicators") or {}).get("quote") or [{}])[0]
     opens = quote.get("open") or []
@@ -705,11 +774,20 @@ def _parse_yahoo(payload: dict, display: str, interval: str, range_key: str) -> 
                 low=float(_at(lows, index) if _at(lows, index) is not None else price),
                 close=price,
                 volume=float(_at(volumes, index) or 0),
+                session=stock_session(int(ts), tz, periods) if interval != "1d" else "regular",
             )
         )
     if len(candles) < 2:
         raise MarketError(f"No data for {display}")
+    candles.sort(key=lambda candle: candle.ts)
+    market_time = int(meta.get("regularMarketTime") or candles[-1].ts)
     price = float(meta.get("regularMarketPrice") or candles[-1].close)
+    if interval != "1d" and candles[-1].ts > market_time:
+        market_time, price = candles[-1].ts, candles[-1].close
+    for prefix in ("preMarket", "postMarket"):
+        stamp = int(meta.get(prefix + "Time") or 0)
+        if stamp > market_time and meta.get(prefix + "Price") is not None:
+            market_time, price = stamp, float(meta[prefix + "Price"])
     previous = meta.get("chartPreviousClose") or meta.get("previousClose") or candles[0].open
     candles[-1].close = price
     candles[-1].high = max(candles[-1].high, price)
@@ -725,7 +803,8 @@ def _parse_yahoo(payload: dict, display: str, interval: str, range_key: str) -> 
         price=price,
         previous_close=float(previous),
         tz=str(meta.get("exchangeTimezoneName") or "America/New_York"),
-        market_time=int(meta.get("regularMarketTime") or candles[-1].ts),
+        market_time=market_time,
+        session=stock_session(market_time, tz, periods),
         updated_at=time.time(),
         venue="yahoo",
         session_volume=session,
@@ -794,7 +873,7 @@ async def _nasdaq_quote(
         updated_at=time.time(),
         venue=f"nasdaq:{asset}",
         session_volume=volume,
-        note=note,
+        note="Extended hours unavailable" if prefer_extended_feed() else note,
     )
 
 

@@ -219,6 +219,9 @@ def alpaca_feeds(
 
 class AlpacaFeedTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        session = patch.object(market, "prefer_extended_feed", return_value=False)
+        session.start()
+        self.addCleanup(session.stop)
         market.configure_alpaca(("key-id", "key-secret"))
         market._ALPACA_SNAPSHOTS.clear()
 
@@ -336,6 +339,64 @@ class AlpacaFeedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quote.price, 123.45)
         self.assertEqual(quote.session_volume, 5400)
         self.assertEqual(seen, [], "a fresh prefetched snapshot should serve the patch")
+
+
+class ExtendedHoursTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        market.configure_alpaca(("key", "secret"))
+        market._yahoo_blocked_until = 0
+
+    def payload(self):
+        payload = yahoo_payload("AAPL")
+        block = payload["chart"]["result"][0]
+        # November uses EST; 17:00 and 17:05 are after-hours.
+        block["timestamp"] = [market._epoch("2026-11-11T22:00:00Z"), market._epoch("2026-11-11T22:05:00Z")]
+        block["meta"]["regularMarketTime"] = market._epoch("2026-11-11T21:00:00Z")
+        return payload
+
+    def test_newer_after_hours_candle_wins_over_regular_price(self):
+        quote = market._parse_yahoo(self.payload(), "AAPL", "5m", "1d")
+        self.assertEqual(quote.price, 41.8)
+        self.assertEqual(quote.market_time, quote.candles[-1].ts)
+        self.assertEqual(quote.session, "after-hours")
+        self.assertEqual(quote.candles[-1].session, "after-hours")
+
+    def test_session_boundaries_and_early_close(self):
+        for stamp, expected in (("13:00", "premarket"), ("14:30", "regular"), ("21:00", "after-hours")):
+            self.assertEqual(market.stock_session(market._epoch(f"2026-11-11T{stamp}:00Z")), expected)
+        ts = market._epoch("2026-11-27T18:30:00Z")
+        self.assertEqual(market.stock_session(ts, periods={"post": {"start": ts-1800, "end": ts+3600}}), "after-hours")
+
+    async def test_extended_load_and_patch_use_same_broader_feed(self):
+        seen = []
+        def handler(host, path, query):
+            seen.append(host)
+            self.assertIn("includePrePost=true", query)
+            return FakeResponse(200, self.payload())
+        with patch.object(market, "prefer_extended_feed", return_value=True):
+            quote = await market.load_quote(FakeClient(handler), "AAPL", "5m", "1d")
+            await market.patch_price(FakeClient(handler), quote)
+        self.assertEqual(quote.venue, "yahoo")
+        self.assertTrue(all("yahoo" in host for host in seen))
+        self.assertEqual(len(quote.candles), 2)
+
+    def test_stale_trade_does_not_create_current_candle(self):
+        quote = market._parse_yahoo(self.payload(), "AAPL", "5m", "1d")
+        before = (quote.price, quote.market_time, len(quote.candles))
+        market.apply_trade(quote, 10, timestamp=quote.market_time-60)
+        self.assertEqual(before, (quote.price, quote.market_time, len(quote.candles)))
+
+    async def test_daily_chart_gets_extended_price(self):
+        client = FakeClient(lambda *args: FakeResponse(200, self.payload()))
+        quote = await market._yahoo_quote(client, "AAPL", "1d", "1mo")
+        self.assertEqual((quote.price, quote.session), (41.8, "after-hours"))
+
+    def test_chart_marks_extended_columns(self):
+        from tuistock.chart import render_chart
+        quote = market._parse_yahoo(self.payload(), "AAPL", "5m", "1d")
+        chart = render_chart(width=60, height=14, candles=quote.candles, sma=[None, None], price=quote.price, previous_close=42, extended_sessions=True)
+        self.assertIn("EXT: shaded", chart.plain)
+        self.assertTrue(any("#30251c" in str(span.style) for span in chart.spans))
 
 
 if __name__ == "__main__":
